@@ -9,9 +9,50 @@ import string
 import aiohttp
 import io
 import base64
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
+
+
+LEGACY_DEFAULT_ADMIN_PASSWORD = "admin123"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def get_env_value(name: str) -> str:
+    """Read a setting from process env first, then fall back to the local .env file."""
+    value = os.getenv(name)
+    if value is not None:
+        return value
+
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return ""
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            if key.strip() != name:
+                continue
+            return raw_value.strip().strip('"').strip("'")
+    except Exception as exc:
+        logger.warning(f"读取 .env 中的 {name} 失败: {exc}")
+
+    return ""
+
+
+def get_bootstrap_admin_password() -> str:
+    """Return the bootstrap admin password from env, falling back to the legacy default."""
+    password = get_env_value("ADMIN_PASSWORD").strip()
+    return password or LEGACY_DEFAULT_ADMIN_PASSWORD
+
+
+def hash_password(password: str) -> str:
+    """Use the project's existing SHA-256 password format."""
+    return hashlib.sha256(password.encode()).hexdigest()
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
@@ -849,18 +890,40 @@ class DBManager:
         """更新admin用户ID"""
         try:
             logger.info("开始更新admin用户ID...")
+            bootstrap_admin_password = get_bootstrap_admin_password()
+            bootstrap_password_hash = hash_password(bootstrap_admin_password)
+            legacy_default_password_hash = hash_password(LEGACY_DEFAULT_ADMIN_PASSWORD)
             # 创建默认admin用户（只在首次初始化时创建）
             cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', ('admin',))
             admin_exists = cursor.fetchone()[0] > 0
 
             if not admin_exists:
                 # 首次创建admin用户，设置默认密码
-                default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash) VALUES
                 ('admin', 'admin@localhost', ?)
-                ''', (default_password_hash,))
-                logger.info("创建默认admin用户，密码: admin123")
+                ''', (bootstrap_password_hash,))
+                logger.info("创建默认admin用户，密码来自环境变量 ADMIN_PASSWORD 或默认值")
+            else:
+                cursor.execute(
+                    'SELECT password_hash FROM users WHERE username = ?',
+                    ('admin',),
+                )
+                row = cursor.fetchone()
+                current_password_hash = row[0] if row else None
+                if (
+                    current_password_hash == legacy_default_password_hash
+                    and bootstrap_password_hash != legacy_default_password_hash
+                ):
+                    cursor.execute(
+                        '''
+                        UPDATE users
+                        SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE username = ?
+                        ''',
+                        (bootstrap_password_hash, 'admin'),
+                    )
+                    logger.info("检测到admin仍使用旧默认密码，已同步为环境变量 ADMIN_PASSWORD")
 
             # 获取admin用户ID，用于历史数据绑定
             self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
@@ -3291,7 +3354,7 @@ class DBManager:
         if not user:
             return False
 
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        password_hash = hash_password(password)
         return user['password_hash'] == password_hash and user['is_active']
 
     def update_user_password(self, username: str, new_password: str) -> bool:
@@ -3299,7 +3362,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                password_hash = hash_password(new_password)
 
                 cursor.execute('''
                 UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP

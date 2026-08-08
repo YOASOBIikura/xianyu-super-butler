@@ -22,7 +22,7 @@ from collections import defaultdict
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from app import cookie_manager
-from app.db_manager import db_manager
+from app.db_manager import db_manager, get_bootstrap_admin_password
 from app.product_automation import ProductAutomationService
 from app.file_log_collector import setup_file_logging, get_file_log_collector
 from app.ai_reply_engine import ai_reply_engine
@@ -53,7 +53,7 @@ KEYWORDS_FILE = PROJECT_ROOT / "回复关键字.txt"
 
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
+DEFAULT_ADMIN_PASSWORD = get_bootstrap_admin_password()
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
 

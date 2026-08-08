@@ -9313,21 +9313,61 @@ class XianyuLive:
 
     @staticmethod
     def _select_item_group(groups):
-        """优先选择当前账号的“在售”分组。"""
+        """优先选择当前账号的“在售”分组，并兼容闲鱼分组命名变化。"""
         if not isinstance(groups, list):
             return None
-        for group in groups:
-            if isinstance(group, dict) and group.get('groupName') == '在售':
-                return group
-        for group in groups:
+
+        valid_groups = [group for group in groups if isinstance(group, dict)]
+        if not valid_groups:
+            return None
+
+        sale_keywords = ('在售', '出售中', '销售中', '上架中')
+        excluded_keywords = ('已售', '卖出', '下架', '仓库', '草稿', '回收')
+
+        def get_group_name(group):
+            return str(group.get('groupName') or '').strip()
+
+        def is_sale_status_group(group):
             conditions = group.get('searchCondition') if isinstance(group, dict) else None
-            if isinstance(conditions, list) and any(
+            return isinstance(conditions, list) and any(
                 str(condition.get('status')) == '0'
                 for condition in conditions
                 if isinstance(condition, dict)
-            ):
+            )
+
+        for group in valid_groups:
+            if get_group_name(group) == '在售':
                 return group
-        return None
+
+        for group in valid_groups:
+            group_name = get_group_name(group)
+            if group_name and any(keyword in group_name for keyword in sale_keywords):
+                return group
+
+        for group in valid_groups:
+            if is_sale_status_group(group):
+                return group
+
+        for group in valid_groups:
+            if bool(group.get('defaultGroup')):
+                return group
+
+        for group in valid_groups:
+            group_name = get_group_name(group)
+            if not group_name or not any(keyword in group_name for keyword in excluded_keywords):
+                return group
+
+        return valid_groups[0]
+
+    @staticmethod
+    def _format_debug_json(value, max_length=6000):
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+        if len(text) > max_length:
+            return f"{text[:max_length]}...<truncated {len(text) - max_length} chars>"
+        return text
 
     @staticmethod
     def _extract_item_image(*sources):
@@ -9532,7 +9572,7 @@ class XianyuLive:
             if page_number == 1 or not item_group:
                 discovery_response = await request_item_api({
                     'needGroupInfo': True,
-                    'pageNumber': 1,
+                    'pageNumber': page_number,
                     'pageSize': page_size,
                     'userId': self.myid
                 })
@@ -9544,51 +9584,94 @@ class XianyuLive:
                         return await self.get_item_list_info(page_number, page_size, retry_count + 1)
                     return {'error': f"商品分组发现失败: {error_msg}"}
 
-                groups = discovery_response.get('data', {}).get('itemGroupList', [])
+                discovery_data = discovery_response.get('data', {})
+                groups = discovery_data.get('itemGroupList', [])
                 group_summary = [
                     {
                         'name': group.get('groupName'),
                         'id': group.get('groupId'),
-                        'count': group.get('itemNumber')
+                        'count': group.get('itemNumber'),
+                        'defaultGroup': group.get('defaultGroup'),
+                        'searchCondition': group.get('searchCondition')
                     }
                     for group in groups
                     if isinstance(group, dict)
                 ]
                 logger.info(
                     f"【{self.cookie_id}】商品分组发现: account={self.myid}, "
-                    f"groups={group_summary}"
+                    f"ret={discovery_ret}, "
+                    f"data_fields={sorted(discovery_data.keys()) if isinstance(discovery_data, dict) else []}, "
+                    f"groups={self._format_debug_json(group_summary)}"
                 )
                 item_group = self._select_item_group(groups)
                 if not item_group:
-                    return {
-                        'error': '闲鱼接口未返回“在售”分组，无法确认商品列表',
-                        'response_fields': sorted(discovery_response.get('data', {}).keys())
-                    }
-                self._item_list_group = item_group
+                    direct_items = self._extract_items_from_response(discovery_data)
+                    if isinstance(discovery_data, dict):
+                        direct_total_count = int(discovery_data.get('totalCount') or 0)
+                        has_direct_list = (
+                            bool(direct_items)
+                            or direct_total_count > 0
+                            or bool(discovery_data.get('cardList'))
+                            or bool(discovery_data.get('itemTopicList'))
+                        )
+                    else:
+                        direct_total_count = 0
+                        has_direct_list = False
+                    logger.warning(
+                        f"【{self.cookie_id}】商品分组未匹配，闲鱼原始data="
+                        f"{self._format_debug_json(discovery_data)}"
+                    )
+                    if has_direct_list:
+                        logger.warning(
+                            f"【{self.cookie_id}】闲鱼未返回itemGroupList，但响应里包含商品列表，"
+                            f"直接按默认商品列表解析: page={page_number}, parsed={len(direct_items)}, "
+                            f"totalCount={direct_total_count}"
+                        )
+                        items_data = discovery_data
+                        group_id = None
+                        group_name = '默认商品列表'
+                        declared_count = 0
+                    else:
+                        return {
+                            'error': '闲鱼接口未返回“在售”分组，也未返回可解析的商品列表',
+                            'response_fields': sorted(discovery_data.keys()) if isinstance(discovery_data, dict) else [],
+                            'item_groups': group_summary
+                        }
+                else:
+                    self._item_list_group = item_group
+                    logger.info(
+                        f"【{self.cookie_id}】商品分组选中: "
+                        f"{self._format_debug_json({k: item_group.get(k) for k in ('groupName', 'groupId', 'itemNumber', 'defaultGroup', 'searchCondition')})}"
+                    )
 
-            group_id = item_group.get('groupId')
-            group_name = item_group.get('groupName', '在售')
-            res_json = await request_item_api({
-                'needGroupInfo': False,
-                'pageNumber': page_number,
-                'pageSize': page_size,
-                'groupName': group_name,
-                'groupId': str(group_id),
-                'defaultGroup': bool(item_group.get('defaultGroup', True)),
-                'userId': self.myid
-            })
-            response_ret = res_json.get('ret', [])
-            if not response_ret or not str(response_ret[0]).startswith('SUCCESS::'):
-                error_msg = response_ret[0] if response_ret else '未知错误'
-                if 'TOKEN' in str(error_msg).upper():
-                    await asyncio.sleep(0.5)
-                    return await self.get_item_list_info(page_number, page_size, retry_count + 1)
-                return {'error': f"获取商品信息失败: {error_msg}"}
+            if item_group:
+                group_id = item_group.get('groupId')
+                group_name = item_group.get('groupName', '在售')
+                res_json = await request_item_api({
+                    'needGroupInfo': False,
+                    'pageNumber': page_number,
+                    'pageSize': page_size,
+                    'groupName': group_name,
+                    'groupId': str(group_id),
+                    'defaultGroup': bool(item_group.get('defaultGroup', True)),
+                    'userId': self.myid
+                })
+                response_ret = res_json.get('ret', [])
+                if not response_ret or not str(response_ret[0]).startswith('SUCCESS::'):
+                    error_msg = response_ret[0] if response_ret else '未知错误'
+                    if 'TOKEN' in str(error_msg).upper():
+                        await asyncio.sleep(0.5)
+                        return await self.get_item_list_info(page_number, page_size, retry_count + 1)
+                    return {'error': f"获取商品信息失败: {error_msg}"}
 
-            items_data = res_json.get('data', {})
+                items_data = res_json.get('data', {})
+                declared_count = int(item_group.get('itemNumber') or 0)
+
+            if not isinstance(items_data, dict):
+                return {'error': '闲鱼商品列表响应格式异常，data不是对象'}
+
             items_list = self._extract_items_from_response(items_data)
             total_count = int(items_data.get('totalCount') or 0)
-            declared_count = int(item_group.get('itemNumber') or 0)
             effective_total_count = max(total_count, declared_count, len(items_list))
             response_fields = sorted(items_data.keys())
             logger.info(
@@ -9598,6 +9681,10 @@ class XianyuLive:
                 f"groupItemNumber={declared_count}, parsed={len(items_list)}, "
                 f"effectiveTotal={effective_total_count}, "
                 f"nextPage={bool(items_data.get('nextPage'))}"
+            )
+            logger.info(
+                f"【{self.cookie_id}】商品列表原始data摘要: "
+                f"{self._format_debug_json(items_data)}"
             )
 
             if total_count > 0 and not items_list:
